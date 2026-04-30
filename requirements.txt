@@ -1,5 +1,6 @@
 # Redis
 redis==5.0.1
+redisvl>=0.18.0          # SemanticSessionManager for agent memory
 
 # LLM providers (generation only — retrieval/cache/memory are provider-agnostic)
 anthropic>=0.40.0

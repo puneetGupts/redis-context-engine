@@ -96,7 +96,9 @@ async def chat(request: ChatRequest):
         )
 
     # ── Step 3: Session memory ────────────────────────────────────────────────
-    history = session_store.get_history(request.session_id)
+    # SemanticSessionManager: retrieves the turns most *relevant* to the
+    # current question, not just the most recent ones.
+    history = session_store.get_relevant_history(request.session_id, request.question)
 
     # ── Step 4: Context assembly ──────────────────────────────────────────────
     assembled = context_assembler.assemble(

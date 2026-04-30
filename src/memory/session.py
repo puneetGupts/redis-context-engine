@@ -1,148 +1,184 @@
 """
-Per-user session memory backed by Redis Hashes.
+Per-user session memory backed by redisvl SemanticSessionManager.
 
-Pain point this solves:
-  LLMs are stateless — every API call starts from scratch. Without session
-  memory, follow-up questions break entirely. If a user asks "How does Redis
-  Vector Search work?" and follows up with "What index type should I use for
-  that?", Claude has no idea what "that" refers to without the prior turn.
+Upgrade from the raw Redis Hash implementation:
+  The previous version stored the last N conversation turns by recency and
+  injected all of them into every prompt. This works fine for short sessions
+  but degrades as history grows — the context fills with irrelevant old turns.
 
-  This module stores conversation history in Redis under session:{session_id}
-  with a TTL. Each user's memory is completely isolated. When the session
-  expires (30 min of inactivity), memory is automatically cleared by Redis —
-  no manual cleanup needed.
+  redisvl's SemanticSessionManager stores each message as a vector. When a
+  new question arrives, we retrieve the most *semantically relevant* past
+  turns rather than just the most recent ones. If a user asked about HNSW
+  10 turns ago and now asks "what about that index type again?", semantic
+  retrieval finds it. Last-N-turns retrieval doesn't.
 
-Redis data model:
-  Key:    session:{session_id}
-  Type:   Hash
-  Fields:
-    - messages: JSON-encoded list of {role, content} dicts
-    - created_at: Unix timestamp
-    - last_active: Unix timestamp (refreshed on every access)
-  TTL:    SESSION_TTL_SECONDS (default 1800s = 30 min)
+Why redisvl here, but raw primitives for the semantic cache?
+  The session memory upgrade is a genuine functional improvement — semantic
+  search over history is meaningfully better than recency-only. The cache,
+  by contrast, is the core primitive we want to demonstrate at the raw Redis
+  level. Using redisvl for session memory shows we know when to reach for
+  the managed layer; keeping the raw cache shows we understand what it
+  abstracts.
+
+Redis data model (managed by redisvl):
+  Each message is stored as a Hash with a vector embedding under a
+  prefixed key namespace. redisvl creates and manages the HNSW index.
+  TTL is not natively supported by SemanticSessionManager — we handle
+  expiry by clearing on explicit delete or via the /session DELETE endpoint.
 """
 
-import json
-import time
-import redis
+import redis as redis_lib
 from dataclasses import dataclass
+from typing import Optional
+
+from redisvl.extensions.session_manager import SemanticSessionManager
+from redisvl.utils.vectorize import HFTextVectorizer
 
 from config.settings import settings
 
 
 @dataclass
 class Message:
-    role: str    # "user" or "assistant"
+    role: str      # "user" or "assistant"
     content: str
 
 
-def _get_redis_client() -> redis.Redis:
-    return redis.Redis(
-        host=settings.REDIS_HOST,
-        port=settings.REDIS_PORT,
-        password=settings.REDIS_PASSWORD,
-        decode_responses=True,
+# Shared vectorizer — same model used everywhere in the pipeline so all
+# vector spaces are compatible.
+_vectorizer = HFTextVectorizer(model="sentence-transformers/all-MiniLM-L6-v2")
+
+# Redis URL built from settings
+_REDIS_URL = (
+    f"redis://:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{settings.REDIS_PORT}"
+)
+
+
+def _get_manager(session_id: str) -> SemanticSessionManager:
+    """
+    Create a SemanticSessionManager scoped to this session.
+
+    Each session_id gets its own tag so messages never bleed across sessions.
+    The underlying index (redisvl_session_idx) is shared — redisvl filters
+    by session_tag at query time.
+    """
+    return SemanticSessionManager(
+        name="rce_sessions",          # index name prefix in Redis
+        session_tag=session_id,       # per-user isolation via tag filter
+        vectorizer=_vectorizer,
+        distance_threshold=0.7,       # relevance threshold for semantic retrieval
+        redis_url=_REDIS_URL,
     )
 
 
-def _session_key(session_id: str) -> str:
-    return f"session:{session_id}"
+def get_relevant_history(session_id: str, question: str) -> list[Message]:
+    """
+    Retrieve the most semantically relevant past turns for the current question.
+
+    This is the key upgrade over last-N-turns retrieval: instead of always
+    injecting the most recent messages, we find the past turns that are most
+    relevant to what the user is asking right now. A question about HNSW will
+    surface the HNSW conversation even if it happened 10 turns ago.
+
+    Falls back to recent history if no semantically similar turns are found.
+
+    Args:
+        session_id: Unique identifier for the user's session.
+        question: The current user question (used for semantic search).
+
+    Returns:
+        List of Message objects relevant to the question, oldest first.
+    """
+    manager = _get_manager(session_id)
+
+    try:
+        # Try semantic retrieval first — find turns most relevant to this question
+        raw = manager.get_relevant(
+            prompt=question,
+            top_k=settings.MAX_HISTORY_TURNS * 2,
+            as_text=False,
+        )
+        if raw:
+            return [
+                Message(role=m["role"], content=m["content"])
+                for m in raw
+                if "role" in m and "content" in m
+            ]
+
+        # Fall back to most recent turns if nothing is semantically similar
+        raw = manager.get_recent(
+            top_k=settings.MAX_HISTORY_TURNS * 2,
+            as_text=False,
+        )
+        return [
+            Message(role=m["role"], content=m["content"])
+            for m in raw
+            if "role" in m and "content" in m
+        ]
+    except Exception:
+        # New session or index not yet created — return empty history
+        return []
 
 
 def get_history(session_id: str) -> list[Message]:
     """
-    Retrieve conversation history for a session.
-
-    Also refreshes the TTL — any activity resets the 30-minute expiry clock.
-
-    Args:
-        session_id: Unique identifier for the user's session.
-
-    Returns:
-        List of Message objects, oldest first. Empty list if no history.
+    Retrieve the most recent turns (recency-based, no question context).
+    Used in the cache-hit path where we don't have a question to search with.
     """
-    r = _get_redis_client()
-    key = _session_key(session_id)
-
-    raw = r.hget(key, "messages")
-    if not raw:
+    manager = _get_manager(session_id)
+    try:
+        raw = manager.get_recent(
+            top_k=settings.MAX_HISTORY_TURNS * 2,
+            as_text=False,
+        )
+        return [
+            Message(role=m["role"], content=m["content"])
+            for m in raw
+            if "role" in m and "content" in m
+        ]
+    except Exception:
         return []
-
-    # Refresh TTL on every read — session stays alive as long as user is active
-    r.expire(key, settings.SESSION_TTL_SECONDS)
-    r.hset(key, "last_active", str(time.time()))
-
-    messages_data = json.loads(raw)
-    return [Message(role=m["role"], content=m["content"]) for m in messages_data]
 
 
 def append_turn(session_id: str, user_message: str, assistant_message: str) -> None:
     """
-    Append a user/assistant turn to the session history.
+    Append a user/assistant turn to the session's vector store.
 
-    Keeps only the last MAX_HISTORY_TURNS turns to stay within token budget.
-    Older history is dropped — recency matters more than completeness.
+    redisvl embeds each message individually, so both the user question and
+    the assistant answer are searchable by future semantic queries.
 
     Args:
         session_id: Unique identifier for the user's session.
         user_message: The user's question.
-        assistant_message: Claude's response.
+        assistant_message: The assistant's response.
     """
-    r = _get_redis_client()
-    key = _session_key(session_id)
-
-    now = time.time()
-    existing = get_history(session_id)
-
-    # Append new turn
-    existing.append(Message(role="user", content=user_message))
-    existing.append(Message(role="assistant", content=assistant_message))
-
-    # Trim to last MAX_HISTORY_TURNS turns (each turn = 2 messages)
-    max_messages = settings.MAX_HISTORY_TURNS * 2
-    if len(existing) > max_messages:
-        existing = existing[-max_messages:]
-
-    messages_json = json.dumps([{"role": m.role, "content": m.content} for m in existing])
-
-    r.hset(
-        key,
-        mapping={
-            "messages": messages_json,
-            "last_active": str(now),
-        },
-    )
-
-    # Set created_at only if it doesn't exist
-    if not r.hexists(key, "created_at"):
-        r.hset(key, "created_at", str(now))
-
-    r.expire(key, settings.SESSION_TTL_SECONDS)
+    manager = _get_manager(session_id)
+    manager.add_messages([
+        {"role": "user",      "content": user_message},
+        {"role": "assistant", "content": assistant_message},
+    ])
 
 
 def clear_session(session_id: str) -> None:
     """Delete all memory for a session."""
-    r = _get_redis_client()
-    r.delete(_session_key(session_id))
+    manager = _get_manager(session_id)
+    try:
+        manager.clear()
+    except Exception:
+        pass
 
 
 def get_session_info(session_id: str) -> dict:
     """Return metadata about a session (for the /session endpoint)."""
-    r = _get_redis_client()
-    key = _session_key(session_id)
-
-    if not r.exists(key):
+    manager = _get_manager(session_id)
+    try:
+        messages = manager.get_recent(as_text=False)
+        if not messages:
+            return {"session_id": session_id, "exists": False}
+        return {
+            "session_id": session_id,
+            "exists": True,
+            "turn_count": len(messages) // 2,
+            "messages": messages,
+        }
+    except Exception:
         return {"session_id": session_id, "exists": False}
-
-    data = r.hgetall(key)
-    messages_data = json.loads(data.get("messages", "[]"))
-
-    return {
-        "session_id": session_id,
-        "exists": True,
-        "turn_count": len(messages_data) // 2,
-        "created_at": data.get("created_at"),
-        "last_active": data.get("last_active"),
-        "ttl_seconds": r.ttl(key),
-        "messages": messages_data,
-    }

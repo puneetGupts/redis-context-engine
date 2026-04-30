@@ -110,19 +110,27 @@ non-negotiable in production vector systems.
 
 ### 4. Session Memory
 
+Backed by **redisvl's `SemanticSessionManager`** — Redis's official agent memory abstraction.
+
 ```
-Redis Hash: session:{session_id}
-  messages:    JSON array of {role, content}
-  created_at:  Unix timestamp
-  last_active: Unix timestamp (refreshed on every read)
-  TTL:         1800s (reset on every access)
+redisvl index: rce_sessions (HNSW, 384-dim, cosine)
+  Each message → individual vector entry tagged with session_id
+  Retrieval: get_relevant(question) → top-K semantically similar past turns
+  Fallback:  get_recent(top_k) → most recent turns if nothing is relevant
 ```
 
-**Design decisions:**
+**Why SemanticSessionManager over raw Redis Hash:**
 
-- **TTL reset on access** — Active sessions stay alive indefinitely. Inactive sessions expire automatically. No cleanup job needed.
-- **Max N turns** — We keep only the last `MAX_HISTORY_TURNS` (default 3) conversation turns. Recency matters more than completeness — older history is less relevant and wastes tokens.
-- **Per-session isolation** — Each `session_id` is a separate Redis Hash. There is no shared state between users.
+The previous version stored the last N turns by recency and injected all of them into every prompt. This approach breaks for longer sessions — the context fills with irrelevant old turns.
+
+SemanticSessionManager stores each message as a vector. When a new question arrives, `get_relevant()` finds the *most semantically relevant* past turns, not just the most recent. If a user asked about HNSW 10 turns ago and now asks "what index type does it use?", semantic retrieval surfaces that turn. Last-N-turns retrieval doesn't.
+
+**Why redisvl here, but raw primitives for the semantic cache:**
+
+Using redisvl for session memory is a genuine functional upgrade — semantic search over history is meaningfully better. The semantic cache, by contrast, is the core primitive we want to understand at the raw Redis level. Using redisvl for one layer and raw primitives for the other demonstrates knowing *when* to reach for the managed abstraction.
+
+- **Per-session isolation** — Each `session_id` is a separate tag. redisvl filters by tag at query time — no shared state between users.
+- **Shared index** — All sessions share one HNSW index (`rce_sessions`). Efficient — no per-user index creation overhead.
 
 ---
 
