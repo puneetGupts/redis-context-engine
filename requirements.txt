@@ -1,0 +1,26 @@
+# Redis
+redis==5.0.1
+
+# LLM providers (generation only — retrieval/cache/memory are provider-agnostic)
+anthropic>=0.40.0
+openai>=1.40.0
+
+# Local embeddings (free, no API key needed)
+sentence-transformers==3.0.1
+
+# API
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.4
+
+# Web scraping (ingestion)
+requests==2.31.0
+beautifulsoup4==4.12.3
+lxml==5.1.0
+
+# Token counting
+tiktoken==0.6.0
+
+# Utilities
+python-dotenv==1.0.1
+numpy==1.26.4
